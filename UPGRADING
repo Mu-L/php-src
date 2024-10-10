@@ -22,7 +22,7 @@ PHP 8.5 UPGRADE NOTES
 - BZ2:
   . bzcompress() now throws a ValueError when $block_size is not between
     1 and 9.
-  . bzcompress() now throws a ValueError when work_factor is not between
+  . bzcompress() now throws a ValueError when $work_factor is not between
     0 and 250.
 
 - LDAP:
@@ -36,6 +36,17 @@ PHP 8.5 UPGRADE NOTES
 ========================================
 2. New Features
 ========================================
+
+- DOM:
+  . Added Dom\Element::$outerHTML.
+
+- XSL:
+  . The $namespace argument of XSLTProcessor::getParameter(),
+    XSLTProcessor::setParameter() and XSLTProcessor::removeParameter()
+    now actually works instead of being treated as empty.
+    This only works if the $name argument does not use Clark notation
+    and is not a QName because in those cases the namespace is taken
+    from the namespace href or prefix respectively.
 
 ========================================
 3. Changes in SAPI modules
@@ -54,6 +65,9 @@ PHP 8.5 UPGRADE NOTES
   . Pdo\Pgsql::setAttribute and Pdo\Pgsql::prepare supports
     PDO::ATTR_PREFETCH sets to 0 which set to lazy fetch mode.
     In this mode, statements cannot be run parallely.
+
+- PGSQL:
+  . pg_copy_from also supports inputs as Iterable.
 
 ========================================
 6. New Functions
@@ -88,6 +102,10 @@ PHP 8.5 UPGRADE NOTES
 12. Windows Support
 ========================================
 
+* The configuration variables PHP_VERSION, PHP_MINOR_VERSION, and
+  PHP_RELEASE_VERSION are now always numbers.  Previously, they have been
+  strings for buildconf builds.
+
 ========================================
 13. Other Changes
 ========================================
@@ -95,3 +113,6 @@ PHP 8.5 UPGRADE NOTES
 ========================================
 14. Performance Improvements
 ========================================
+
+- XMLWriter:
+  . Improved performance and reduce memory consumption.

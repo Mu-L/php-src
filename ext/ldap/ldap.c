@@ -234,6 +234,31 @@ static void ldap_result_entry_free_obj(zend_object *obj)
 	} \
 }
 
+/* An LDAP value must be a string, however it defines a format for integer and
+ * booleans, thus we parse zvals to the corresponding string if possible
+ * See RFC 4517: https://datatracker.ietf.org/doc/html/rfc4517 */
+static zend_string* php_ldap_try_get_ldap_value_from_zval(zval *zv) {
+	switch (Z_TYPE_P(zv)) {
+		case IS_STRING:
+		case IS_LONG:
+		/* Object might be stringable */
+		case IS_OBJECT:
+			return zval_try_get_string(zv);
+		case IS_TRUE:
+			return ZSTR_INIT_LITERAL("TRUE", false);
+		case IS_FALSE:
+			return ZSTR_INIT_LITERAL("FALSE", false);
+		default:
+			zend_type_error("LDAP value must be of type string|int|bool, %s given", zend_zval_value_name(zv));
+			return NULL;
+	}
+}
+
+/* The char pointer MUST refer to the char* of a zend_string struct */
+static void php_ldap_zend_string_release_from_char_pointer(char *ptr) {
+	zend_string_release((zend_string*) (ptr - XtOffsetOf(zend_string, val)));
+}
+
 /* {{{ Parse controls from and to arrays */
 static void _php_ldap_control_to_array(LDAP *ld, LDAPControl* ctrl, zval* array, int request)
 {
@@ -381,17 +406,16 @@ static void _php_ldap_control_to_array(LDAP *ld, LDAPControl* ctrl, zval* array,
 	}
 }
 
-static int _php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, zval* array)
+static int php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, const HashTable *control_ht)
 {
 	zval* val;
 	zend_string *control_oid;
-	int control_iscritical = 0, rc = LDAP_SUCCESS;
 	char** ldap_attrs = NULL;
 	LDAPSortKey** sort_keys = NULL;
 	zend_string *tmpstring = NULL, **tmpstrings1 = NULL, **tmpstrings2 = NULL;
 	size_t num_tmpstrings1 = 0, num_tmpstrings2 = 0;
 
-	if ((val = zend_hash_str_find(Z_ARRVAL_P(array), "oid", sizeof("oid") - 1)) == NULL) {
+	if ((val = zend_hash_str_find(control_ht, "oid", sizeof("oid") - 1)) == NULL) {
 		zend_value_error("%s(): Control must have an \"oid\" key", get_active_function_name());
 		return -1;
 	}
@@ -401,17 +425,17 @@ static int _php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, zval* arra
 		return -1;
 	}
 
-	if ((val = zend_hash_str_find(Z_ARRVAL_P(array), "iscritical", sizeof("iscritical") - 1)) != NULL) {
+	bool control_iscritical = false;
+	if ((val = zend_hash_str_find(control_ht, "iscritical", sizeof("iscritical") - 1)) != NULL) {
 		control_iscritical = zend_is_true(val);
-	} else {
-		control_iscritical = 0;
 	}
 
 	BerElement *ber = NULL;
 	struct berval control_value = { 0L, NULL };
-	int control_value_alloc = 0;
+	bool control_value_alloc = false;
+	int rc = LDAP_SUCCESS;
 
-	if ((val = zend_hash_find(Z_ARRVAL_P(array), ZSTR_KNOWN(ZEND_STR_VALUE))) != NULL) {
+	if ((val = zend_hash_find(control_ht, ZSTR_KNOWN(ZEND_STR_VALUE))) != NULL) {
 		if (Z_TYPE_P(val) != IS_ARRAY) {
 			tmpstring = zval_get_string(val);
 			if (EG(exception)) {
@@ -420,7 +444,7 @@ static int _php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, zval* arra
 			}
 			control_value.bv_val = ZSTR_VAL(tmpstring);
 			control_value.bv_len = ZSTR_LEN(tmpstring);
-		} else if (strcmp(ZSTR_VAL(control_oid), LDAP_CONTROL_PAGEDRESULTS) == 0) {
+		} else if (zend_string_equals_literal(control_oid, LDAP_CONTROL_PAGEDRESULTS)) {
 			zval* tmp;
 			int pagesize = 1;
 			struct berval cookie = { 0L, NULL };
@@ -442,7 +466,7 @@ static int _php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, zval* arra
 			if (rc != LDAP_SUCCESS) {
 				php_error_docref(NULL, E_WARNING, "Failed to create paged result control value: %s (%d)", ldap_err2string(rc), rc);
 			}
-		} else if (strcmp(ZSTR_VAL(control_oid), LDAP_CONTROL_ASSERT) == 0) {
+		} else if (zend_string_equals_literal(control_oid, LDAP_CONTROL_ASSERT)) {
 			zval* tmp;
 			zend_string* assert;
 			if ((tmp = zend_hash_str_find(Z_ARRVAL_P(val), "filter", sizeof("filter") - 1)) == NULL) {
@@ -466,7 +490,7 @@ static int _php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, zval* arra
 				}
 				zend_string_release(assert);
 			}
-		} else if (strcmp(ZSTR_VAL(control_oid), LDAP_CONTROL_VALUESRETURNFILTER) == 0) {
+		} else if (zend_string_equals_literal(control_oid, LDAP_CONTROL_VALUESRETURNFILTER)) {
 			zval* tmp;
 			if ((tmp = zend_hash_str_find(Z_ARRVAL_P(val), "filter", sizeof("filter") - 1)) == NULL) {
 				rc = -1;
@@ -490,7 +514,7 @@ static int _php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, zval* arra
 					}
 				}
 			}
-		} else if ((strcmp(ZSTR_VAL(control_oid), LDAP_CONTROL_PRE_READ) == 0) || (strcmp(ZSTR_VAL(control_oid), LDAP_CONTROL_POST_READ) == 0)) {
+		} else if (zend_string_equals_literal(control_oid, LDAP_CONTROL_PRE_READ) || zend_string_equals_literal(control_oid, LDAP_CONTROL_POST_READ)) {
 			zval* tmp;
 			if ((tmp = zend_hash_str_find(Z_ARRVAL_P(val), "attrs", sizeof("attrs") - 1)) == NULL) {
 				rc = -1;
@@ -542,7 +566,7 @@ static int _php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, zval* arra
 					}
 				}
 			}
-		} else if (strcmp(ZSTR_VAL(control_oid), LDAP_CONTROL_SORTREQUEST) == 0) {
+		} else if (zend_string_equals_literal(control_oid, LDAP_CONTROL_SORTREQUEST)) {
 			int num_keys, i;
 			zval *sortkey, *tmp;
 
@@ -599,7 +623,7 @@ static int _php_ldap_control_from_array(LDAP *ld, LDAPControl** ctrl, zval* arra
 			if (rc != LDAP_SUCCESS) {
 				php_error_docref(NULL, E_WARNING, "Failed to create sort control value: %s (%d)", ldap_err2string(rc), rc);
 			}
-		} else if (strcmp(ZSTR_VAL(control_oid), LDAP_CONTROL_VLVREQUEST) == 0) {
+		} else if (zend_string_equals_literal(control_oid, LDAP_CONTROL_VLVREQUEST)) {
 			zval* tmp;
 			LDAPVLVInfo vlvInfo;
 			struct berval attrValue;
@@ -745,25 +769,24 @@ static void _php_ldap_controls_to_array(LDAP *ld, LDAPControl** ctrls, zval* arr
 	ldap_controls_free(ctrls);
 }
 
-static LDAPControl** _php_ldap_controls_from_array(LDAP *ld, zval* array, uint32_t arg_num)
+static LDAPControl** php_ldap_controls_from_array(LDAP *ld, const HashTable *controls, uint32_t arg_num)
 {
-	int ncontrols;
 	LDAPControl** ctrlp, **ctrls = NULL;
 	zval* ctrlarray;
 	int error = 0;
 
-	ncontrols = zend_hash_num_elements(Z_ARRVAL_P(array));
-	ctrls = safe_emalloc((1 + ncontrols), sizeof(*ctrls), 0);
+	uint32_t num_controls = zend_hash_num_elements(controls);
+	ctrls = safe_emalloc((1 + num_controls), sizeof(*ctrls), 0);
 	*ctrls = NULL;
 	ctrlp = ctrls;
-	ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(array), ctrlarray) {
+	ZEND_HASH_FOREACH_VAL(controls, ctrlarray) {
 		if (Z_TYPE_P(ctrlarray) != IS_ARRAY) {
 			zend_argument_type_error(arg_num, "must contain only arrays, where each array is a control");
 			error = 1;
 			break;
 		}
 
-		if (_php_ldap_control_from_array(ld, ctrlp, ctrlarray) == LDAP_SUCCESS) {
+		if (php_ldap_control_from_array(ld, ctrlp, Z_ARRVAL_P(ctrlarray)) == LDAP_SUCCESS) {
 			++ctrlp;
 		} else {
 			error = 1;
@@ -1145,25 +1168,25 @@ PHP_FUNCTION(ldap_bind)
 /* {{{ Bind to LDAP directory */
 PHP_FUNCTION(ldap_bind_ext)
 {
-	zval *serverctrls = NULL;
 	zval *link;
 	char *ldap_bind_dn = NULL, *ldap_bind_pw = NULL;
 	size_t ldap_bind_dnlen, ldap_bind_pwlen;
+	HashTable *server_controls_ht = NULL;
 	ldap_linkdata *ld;
 	LDAPControl **lserverctrls = NULL;
 	ldap_resultdata *result;
 	LDAPMessage *ldap_res;
 	int rc;
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS(), "O|p!p!a!", &link, ldap_link_ce, &ldap_bind_dn, &ldap_bind_dnlen, &ldap_bind_pw, &ldap_bind_pwlen, &serverctrls) != SUCCESS) {
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "O|p!p!h!", &link, ldap_link_ce, &ldap_bind_dn, &ldap_bind_dnlen, &ldap_bind_pw, &ldap_bind_pwlen, &server_controls_ht) != SUCCESS) {
 		RETURN_THROWS();
 	}
 
 	ld = Z_LDAP_LINK_P(link);
 	VERIFY_LDAP_LINK_CONNECTED(ld);
 
-	if (serverctrls) {
-		lserverctrls = _php_ldap_controls_from_array(ld->link, serverctrls, 4);
+	if (server_controls_ht) {
+		lserverctrls = php_ldap_controls_from_array(ld->link, server_controls_ht, 4);
 		if (lserverctrls == NULL) {
 			RETVAL_FALSE;
 			goto cleanup;
@@ -1402,11 +1425,13 @@ static void php_set_opts(LDAP *ldap, int sizelimit, int timelimit, int deref, in
 /* {{{ php_ldap_do_search */
 static void php_ldap_do_search(INTERNAL_FUNCTION_PARAMETERS, int scope)
 {
-	zval *link, *attrs = NULL, *attr, *serverctrls = NULL;
-	zend_string *base_dn_str, *filter_str;
-	HashTable *base_dn_ht, *filter_ht;
+	zval *link, *attrs = NULL;
+	HashTable *base_dn_ht = NULL;
+	zend_string *base_dn_str = NULL;
+	HashTable *filter_ht = NULL;
+	zend_string *filter_str = NULL;
 	zend_long attrsonly, sizelimit, timelimit, deref;
-	zend_string *ldap_filter = NULL, *ldap_base_dn = NULL;
+	HashTable *server_controls_ht = NULL;
 	char **ldap_attrs = NULL;
 	ldap_linkdata *ld = NULL;
 	ldap_resultdata *result;
@@ -1414,7 +1439,7 @@ static void php_ldap_do_search(INTERNAL_FUNCTION_PARAMETERS, int scope)
 	LDAPControl **lserverctrls = NULL;
 	int ldap_attrsonly = 0, ldap_sizelimit = -1, ldap_timelimit = -1, ldap_deref = -1;
 	int old_ldap_sizelimit = -1, old_ldap_timelimit = -1, old_ldap_deref = -1;
-	int num_attribs = 0, ret = 1, i, ldap_errno, argcount = ZEND_NUM_ARGS();
+	int ret = 1, ldap_errno, argcount = ZEND_NUM_ARGS();
 
 	ZEND_PARSE_PARAMETERS_START(3, 9)
 		Z_PARAM_ZVAL(link)
@@ -1426,7 +1451,7 @@ static void php_ldap_do_search(INTERNAL_FUNCTION_PARAMETERS, int scope)
 		Z_PARAM_LONG(sizelimit)
 		Z_PARAM_LONG(timelimit)
 		Z_PARAM_LONG(deref)
-		Z_PARAM_ARRAY_EX(serverctrls, 1, 1)
+		Z_PARAM_ARRAY_HT_EX(server_controls_ht, 1, 1)
 	ZEND_PARSE_PARAMETERS_END();
 
 	/* Reverse -> fall through */
@@ -1444,38 +1469,52 @@ static void php_ldap_do_search(INTERNAL_FUNCTION_PARAMETERS, int scope)
 		case 5:
 			ldap_attrsonly = attrsonly;
 			ZEND_FALLTHROUGH;
-		case 4:
-			num_attribs = zend_hash_num_elements(Z_ARRVAL_P(attrs));
-			ldap_attrs = safe_emalloc((num_attribs+1), sizeof(char *), 0);
-
-			for (i = 0; i<num_attribs; i++) {
-				if ((attr = zend_hash_index_find(Z_ARRVAL_P(attrs), i)) == NULL) {
-					php_error_docref(NULL, E_WARNING, "Array initialization wrong");
-					ret = 0;
-					goto cleanup;
-				}
-
-				convert_to_string(attr);
-				if (EG(exception)) {
-					ret = 0;
-					goto cleanup;
-				}
-				ldap_attrs[i] = Z_STRVAL_P(attr);
-			}
-			ldap_attrs[num_attribs] = NULL;
-			ZEND_FALLTHROUGH;
 		default:
 			break;
 	}
 
+	if (attrs) {
+		const HashTable *attributes = Z_ARRVAL_P(attrs);
+		uint32_t num_attribs = zend_hash_num_elements(attributes);
+
+		if (num_attribs == 0) {
+			/* We don't allocate ldap_attrs for an empty array */
+			goto process;
+		}
+		if (!zend_array_is_list(attributes)) {
+			zend_argument_value_error(4, "must be a list");
+			RETURN_THROWS();
+		}
+		/* Allocate +1 as we need an extra entry to NULL terminate the list */
+		ldap_attrs = safe_emalloc(num_attribs+1, sizeof(char *), 0);
+
+		zend_ulong attribute_index = 0;
+		zval *attribute_zv = NULL;
+		ZEND_HASH_FOREACH_NUM_KEY_VAL(attributes, attribute_index, attribute_zv) {
+			ZVAL_DEREF(attribute_zv);
+			if (Z_TYPE_P(attribute_zv) != IS_STRING) {
+				zend_argument_type_error(4, "must be a list of strings, %s given", zend_zval_value_name(attribute_zv));
+				ret = 0;
+				goto cleanup;
+			}
+			zend_string *attribute = Z_STR_P(attribute_zv);
+			if (zend_str_has_nul_byte(attribute)) {
+				zend_argument_value_error(4, "must not contain strings with any null bytes");
+				ret = 0;
+				goto cleanup;
+			}
+			ldap_attrs[attribute_index] = ZSTR_VAL(attribute);
+		} ZEND_HASH_FOREACH_END();
+		ldap_attrs[num_attribs] = NULL;
+	}
+process:
+
 	/* parallel search? */
 	if (Z_TYPE_P(link) == IS_ARRAY) {
-		int i, nlinks, nbases, nfilters, *rcs;
-		ldap_linkdata **lds;
-		zval *entry, object;
-
-		nlinks = zend_hash_num_elements(Z_ARRVAL_P(link));
-		if (nlinks == 0) {
+		const zend_string *ldap_base_dn = NULL;
+		const zend_string *ldap_filter = NULL;
+		uint32_t num_links = zend_hash_num_elements(Z_ARRVAL_P(link));
+		if (num_links == 0) {
 			zend_argument_must_not_be_empty_error(1);
 			ret = 0;
 			goto cleanup;
@@ -1486,105 +1525,134 @@ static void php_ldap_do_search(INTERNAL_FUNCTION_PARAMETERS, int scope)
 			goto cleanup;
 		}
 
+		uint32_t num_base_dns = 0; /* If 0 this means we are working with a unique base dn */
 		if (base_dn_ht) {
-			nbases = zend_hash_num_elements(base_dn_ht);
-			if (nbases != nlinks) {
-				zend_argument_value_error(2, "must have the same number of elements as the links array");
+			if (!zend_array_is_list(base_dn_ht)) {
+				zend_argument_value_error(2, "must be a list");
 				ret = 0;
 				goto cleanup;
 			}
-			zend_hash_internal_pointer_reset(base_dn_ht);
+			num_base_dns = zend_hash_num_elements(base_dn_ht);
+			if (num_base_dns != num_links) {
+				zend_argument_value_error(2, "must be the same size as argument #1");
+				ret = 0;
+				goto cleanup;
+			}
 		} else {
-			nbases = 0; /* this means string, not array */
-			ldap_base_dn = zend_string_copy(base_dn_str);
-			if (EG(exception)) {
+			if (zend_str_has_nul_byte(base_dn_str)) {
+				zend_argument_value_error(2, "must not contain null bytes");
 				ret = 0;
 				goto cleanup;
 			}
-			// TODO check filter does not have any nul bytes
+			ldap_base_dn = base_dn_str;
 		}
 
+		uint32_t num_filters = 0; /* If 0 this means we are working with a unique base dn */
 		if (filter_ht) {
-			nfilters = zend_hash_num_elements(filter_ht);
-			if (nfilters != nlinks) {
-				zend_argument_value_error(3, "must have the same number of elements as the links array");
+			if (!zend_array_is_list(filter_ht)) {
+				zend_argument_value_error(3, "must be a list");
 				ret = 0;
 				goto cleanup;
 			}
-			zend_hash_internal_pointer_reset(filter_ht);
+			num_filters = zend_hash_num_elements(filter_ht);
+			if (num_filters != num_links) {
+				zend_argument_value_error(3, "must be the same size as argument #1");
+				ret = 0;
+				goto cleanup;
+			}
 		} else {
-			nfilters = 0; /* this means string, not array */
-			ldap_filter = zend_string_copy(filter_str);
-			// TODO check filter does not have any nul bytes
+			if (zend_str_has_nul_byte(filter_str)) {
+				zend_argument_value_error(3, "must not contain null bytes");
+				ret = 0;
+				goto cleanup;
+			}
+			ldap_filter = filter_str;
 		}
 
-		lds = safe_emalloc(nlinks, sizeof(ldap_linkdata), 0);
-		rcs = safe_emalloc(nlinks, sizeof(*rcs), 0);
+		int *rcs;
+		ldap_linkdata **lds;
+		lds = safe_emalloc(num_links, sizeof(ldap_linkdata), 0);
+		rcs = safe_emalloc(num_links, sizeof(*rcs), 0);
 
-		zend_hash_internal_pointer_reset(Z_ARRVAL_P(link));
-		for (i=0; i<nlinks; i++) {
-			entry = zend_hash_get_current_data(Z_ARRVAL_P(link));
-
-			if (Z_TYPE_P(entry) != IS_OBJECT || !instanceof_function(Z_OBJCE_P(entry), ldap_link_ce)) {
-				zend_argument_value_error(1, "must only contain objects of type LDAP");
+		zend_ulong ldap_link_index = 0;
+		zval *link_zv = NULL;
+		ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(link), ldap_link_index, link_zv) {
+			ZVAL_DEREF(link_zv);
+			if (Z_TYPE_P(link_zv) != IS_OBJECT || !instanceof_function(Z_OBJCE_P(link_zv), ldap_link_ce)) {
+				zend_argument_value_error(1, "must be a list of LDAP\\Connection");
 				ret = 0;
 				goto cleanup_parallel;
 			}
 
-			ld = Z_LDAP_LINK_P(entry);
-			if (!ld->link) {
+			ldap_linkdata *current_ld = Z_LDAP_LINK_P(link_zv);
+			if (!current_ld->link) {
 				zend_throw_error(NULL, "LDAP connection has already been closed");
 				ret = 0;
 				goto cleanup_parallel;
 			}
 
-			if (nbases != 0) { /* base_dn an array? */
-				entry = zend_hash_get_current_data(base_dn_ht);
-				zend_hash_move_forward(base_dn_ht);
-				ldap_base_dn = zval_get_string(entry);
-				if (EG(exception)) {
+			if (num_base_dns != 0) { /* base_dn an array? */
+				zval *base_dn_zv = zend_hash_index_find(base_dn_ht, ldap_link_index);
+				ZEND_ASSERT(base_dn_zv);
+				ZVAL_DEREF(base_dn_zv);
+				if (Z_TYPE_P(base_dn_zv) != IS_STRING) {
+					zend_argument_type_error(2, "must be a list of strings, %s given", zend_zval_value_name(base_dn_zv));
 					ret = 0;
 					goto cleanup_parallel;
 				}
-				// TODO check dn does not have any nul bytes
+				ldap_base_dn = Z_STR_P(base_dn_zv);
+				if (zend_str_has_nul_byte(ldap_base_dn)) {
+					zend_argument_value_error(2, "must not contain null bytes");
+					ret = 0;
+					goto cleanup_parallel;
+				}
 			}
-			if (nfilters != 0) { /* filter an array? */
-				entry = zend_hash_get_current_data(filter_ht);
-				zend_hash_move_forward(filter_ht);
-				ldap_filter = zval_get_string(entry);
-				if (EG(exception)) {
+			if (num_filters != 0) { /* filter an array? */
+				zval *filter_zv = zend_hash_index_find(filter_ht, ldap_link_index);
+				ZEND_ASSERT(filter_zv);
+				ZVAL_DEREF(filter_zv);
+				if (Z_TYPE_P(filter_zv) != IS_STRING) {
+					zend_argument_type_error(3, "must be a list of strings, %s given", zend_zval_value_name(filter_zv));
 					ret = 0;
 					goto cleanup_parallel;
 				}
-				// TODO check filter does not have any nul bytes
+				ldap_filter = Z_STR_P(filter_zv);
+				if (zend_str_has_nul_byte(ldap_filter)) {
+					zend_argument_value_error(3, "must not contain null bytes");
+					ret = 0;
+					goto cleanup_parallel;
+				}
 			}
 
-			if (serverctrls) {
+			if (server_controls_ht) {
 				/* We have to parse controls again for each link as they use it */
 				_php_ldap_controls_free(&lserverctrls);
-				lserverctrls = _php_ldap_controls_from_array(ld->link, serverctrls, 9);
+				lserverctrls = php_ldap_controls_from_array(current_ld->link, server_controls_ht, 9);
 				if (lserverctrls == NULL) {
-					rcs[i] = -1;
+					rcs[ldap_link_index] = -1;
+					// TODO Throw an exception/cleanup?
 					continue;
 				}
 			}
 
-			php_set_opts(ld->link, ldap_sizelimit, ldap_timelimit, ldap_deref, &old_ldap_sizelimit, &old_ldap_timelimit, &old_ldap_deref);
+			php_set_opts(current_ld->link, ldap_sizelimit, ldap_timelimit, ldap_deref, &old_ldap_sizelimit, &old_ldap_timelimit, &old_ldap_deref);
 
 			/* Run the actual search */
-			ldap_search_ext(ld->link, ZSTR_VAL(ldap_base_dn), scope, ZSTR_VAL(ldap_filter), ldap_attrs, ldap_attrsonly, lserverctrls, NULL, NULL, ldap_sizelimit, &rcs[i]);
-			lds[i] = ld;
-			zend_hash_move_forward(Z_ARRVAL_P(link));
-		}
+			ldap_search_ext(current_ld->link, ZSTR_VAL(ldap_base_dn), scope, ZSTR_VAL(ldap_filter), ldap_attrs, ldap_attrsonly, lserverctrls, NULL, NULL, ldap_sizelimit, &rcs[ldap_link_index]);
+			lds[ldap_link_index] = current_ld;
+
+			// TODO Reset the options of the link?
+		} ZEND_HASH_FOREACH_END();
 
 		array_init(return_value);
 
 		/* Collect results from the searches */
-		for (i=0; i<nlinks; i++) {
+		for (uint32_t i = 0; i < num_links; i++) {
 			if (rcs[i] != -1) {
 				rcs[i] = ldap_result(lds[i]->link, LDAP_RES_ANY, 1 /* LDAP_MSG_ALL */, NULL, &ldap_res);
 			}
 			if (rcs[i] != -1) {
+				zval object;
 				object_init_ex(&object, ldap_result_ce);
 				result = Z_LDAP_RESULT_P(&object);
 				result->result = ldap_res;
@@ -1606,21 +1674,19 @@ cleanup_parallel:
 		}
 
 		if (!base_dn_str) {
-			zend_argument_type_error(2, "must be of type string when argument #1 ($ldap) is an LDAP instance");
+			zend_argument_type_error(2, "must be of type string when argument #1 ($ldap) is an LDAP\\Connection instance");
 			ret = 0;
 			goto cleanup;
 		}
-		ldap_base_dn = zend_string_copy(base_dn_str);
 
 		if (!filter_str) {
-			zend_argument_type_error(3, "must be of type string when argument #1 ($ldap) is an LDAP instance");
+			zend_argument_type_error(3, "must be of type string when argument #1 ($ldap) is an LDAP\\Connection instance");
 			ret = 0;
 			goto cleanup;
 		}
-		ldap_filter = zend_string_copy(filter_str);
 
-		if (serverctrls) {
-			lserverctrls = _php_ldap_controls_from_array(ld->link, serverctrls, 9);
+		if (server_controls_ht) {
+			lserverctrls = php_ldap_controls_from_array(ld->link, server_controls_ht, 9);
 			if (lserverctrls == NULL) {
 				ret = 0;
 				goto cleanup;
@@ -1630,7 +1696,7 @@ cleanup_parallel:
 		php_set_opts(ld->link, ldap_sizelimit, ldap_timelimit, ldap_deref, &old_ldap_sizelimit, &old_ldap_timelimit, &old_ldap_deref);
 
 		/* Run the actual search */
-		ldap_errno = ldap_search_ext_s(ld->link, ZSTR_VAL(ldap_base_dn), scope, ZSTR_VAL(ldap_filter), ldap_attrs, ldap_attrsonly, lserverctrls, NULL, NULL, ldap_sizelimit, &ldap_res);
+		ldap_errno = ldap_search_ext_s(ld->link, ZSTR_VAL(base_dn_str), scope, ZSTR_VAL(filter_str), ldap_attrs, ldap_attrsonly, lserverctrls, NULL, NULL, ldap_sizelimit, &ldap_res);
 
 		if (ldap_errno != LDAP_SUCCESS
 			&& ldap_errno != LDAP_SIZELIMIT_EXCEEDED
@@ -1662,19 +1728,13 @@ cleanup_parallel:
 			result->result = ldap_res;
 		}
 	} else {
-		zend_argument_type_error(1, "must be of type LDAP|array, %s given", zend_zval_value_name(link));
+		zend_argument_type_error(1, "must be of type LDAP\\Connection|array, %s given", zend_zval_value_name(link));
 	}
 
 cleanup:
 	if (ld) {
 		/* Restoring previous options */
 		php_set_opts(ld->link, old_ldap_sizelimit, old_ldap_timelimit, old_ldap_deref, &ldap_sizelimit, &ldap_timelimit, &ldap_deref);
-	}
-	if (ldap_filter) {
-		zend_string_release(ldap_filter);
-	}
-	if (ldap_base_dn) {
-		zend_string_release(ldap_base_dn);
 	}
 	if (ldap_attrs != NULL) {
 		efree(ldap_attrs);
@@ -2157,32 +2217,34 @@ PHP_FUNCTION(ldap_dn2ufn)
 /* {{{ php_ldap_do_modify */
 static void php_ldap_do_modify(INTERNAL_FUNCTION_PARAMETERS, int oper, int ext)
 {
-	zval *serverctrls = NULL;
-	zval *link, *entry, *value, *ivalue;
+	zval *link;
 	ldap_linkdata *ld;
 	char *dn;
+	HashTable *attributes_ht;
+	HashTable *server_controls_ht = NULL;
 	LDAPMod **ldap_mods;
 	LDAPControl **lserverctrls = NULL;
 	ldap_resultdata *result;
 	LDAPMessage *ldap_res;
-	int i, j, num_attribs, num_values, msgid;
 	size_t dn_len;
-	int *num_berval;
-	zend_string *attribute;
-	zend_ulong index;
 	int is_full_add=0; /* flag for full add operation so ldap_mod_add can be put back into oper, gerrit THomson */
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS(), "Opa/|a!", &link, ldap_link_ce, &dn, &dn_len, &entry, &serverctrls) != SUCCESS) {
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "Oph/|h!", &link, ldap_link_ce, &dn, &dn_len, &attributes_ht, &server_controls_ht) != SUCCESS) {
 		RETURN_THROWS();
 	}
 
 	ld = Z_LDAP_LINK_P(link);
 	VERIFY_LDAP_LINK_CONNECTED(ld);
 
-	num_attribs = zend_hash_num_elements(Z_ARRVAL_P(entry));
+	uint32_t num_attribs = zend_hash_num_elements(attributes_ht);
+	if (num_attribs == 0) {
+		zend_argument_must_not_be_empty_error(3);
+		RETURN_THROWS();
+	}
+
 	ldap_mods = safe_emalloc((num_attribs+1), sizeof(LDAPMod *), 0);
-	num_berval = safe_emalloc(num_attribs, sizeof(int), 0);
-	zend_hash_internal_pointer_reset(Z_ARRVAL_P(entry));
+	/* Zero out the list */
+	memset(ldap_mods, 0, sizeof(LDAPMod *) * (num_attribs+1));
 
 	/* added by gerrit thomson to fix ldap_add using ldap_mod_add */
 	if (oper == PHP_LD_FULL_ADD) {
@@ -2191,96 +2253,108 @@ static void php_ldap_do_modify(INTERNAL_FUNCTION_PARAMETERS, int oper, int ext)
 	}
 	/* end additional , gerrit thomson */
 
-	for (i = 0; i < num_attribs; i++) {
-		ldap_mods[i] = emalloc(sizeof(LDAPMod));
-		ldap_mods[i]->mod_op = oper | LDAP_MOD_BVALUES;
-		ldap_mods[i]->mod_type = NULL;
-
-		if (zend_hash_get_current_key(Z_ARRVAL_P(entry), &attribute, &index) == HASH_KEY_IS_STRING) {
-			ldap_mods[i]->mod_type = estrndup(ZSTR_VAL(attribute), ZSTR_LEN(attribute));
-		} else {
-			php_error_docref(NULL, E_WARNING, "Unknown attribute in the data");
-			/* Free allocated memory */
-			while (i >= 0) {
-				if (ldap_mods[i]->mod_type) {
-					efree(ldap_mods[i]->mod_type);
-				}
-				efree(ldap_mods[i]);
-				i--;
-			}
-			efree(num_berval);
-			efree(ldap_mods);
-			RETURN_FALSE;
+	zend_string *attribute = NULL;
+	zval *attribute_values = NULL;
+	unsigned int attribute_index = 0;
+	ZEND_HASH_FOREACH_STR_KEY_VAL(attributes_ht, attribute, attribute_values) {
+		if (attribute == NULL) {
+			zend_argument_value_error(3, "must be an associative array of attribute => values");
+			RETVAL_FALSE;
+			goto cleanup;
+		}
+		if (ZSTR_LEN(attribute) == 0) {
+			zend_argument_value_error(3, "key must not be empty");
+			RETVAL_FALSE;
+			goto cleanup;
+		}
+		if (zend_str_has_nul_byte(attribute)) {
+			zend_argument_value_error(3, "key must not contain any null bytes");
+			RETVAL_FALSE;
+			goto cleanup;
 		}
 
-		value = zend_hash_get_current_data(Z_ARRVAL_P(entry));
+		ldap_mods[attribute_index] = emalloc(sizeof(LDAPMod));
+		ldap_mods[attribute_index]->mod_op = oper | LDAP_MOD_BVALUES;
+		/* No need to duplicate the string as it is not consumed and the zend_string will not be released */
+		ldap_mods[attribute_index]->mod_type = ZSTR_VAL(attribute);
+		ldap_mods[attribute_index]->mod_bvalues = NULL;
 
-		ZVAL_DEREF(value);
-		if (Z_TYPE_P(value) != IS_ARRAY) {
-			num_values = 1;
-		} else {
-			SEPARATE_ARRAY(value);
-			num_values = zend_hash_num_elements(Z_ARRVAL_P(value));
-		}
-
-		num_berval[i] = num_values;
-		ldap_mods[i]->mod_bvalues = safe_emalloc((num_values + 1), sizeof(struct berval *), 0);
-
-/* allow for arrays with one element, no allowance for arrays with none but probably not required, gerrit thomson. */
-		if ((num_values == 1) && (Z_TYPE_P(value) != IS_ARRAY)) {
-			convert_to_string(value);
-			if (EG(exception)) {
+		ZVAL_DEREF(attribute_values);
+		/* If the attribute takes a single value it can be passed directly instead of as a list with one element */
+		/* allow for arrays with one element, no allowance for arrays with none but probably not required, gerrit thomson. */
+		if (Z_TYPE_P(attribute_values) != IS_ARRAY) {
+			zend_string *value = php_ldap_try_get_ldap_value_from_zval(attribute_values);
+			if (UNEXPECTED(value == NULL)) {
 				RETVAL_FALSE;
 				goto cleanup;
 			}
-			ldap_mods[i]->mod_bvalues[0] = (struct berval *) emalloc (sizeof(struct berval));
-			ldap_mods[i]->mod_bvalues[0]->bv_val = Z_STRVAL_P(value);
-			ldap_mods[i]->mod_bvalues[0]->bv_len = Z_STRLEN_P(value);
+			ldap_mods[attribute_index]->mod_bvalues = safe_emalloc(2, sizeof(struct berval *), 0);
+			ldap_mods[attribute_index]->mod_bvalues[0] = (struct berval *) emalloc (sizeof(struct berval));
+			/* The string will be free by php_ldap_zend_string_release_from_char_pointer() during cleanup */
+			ldap_mods[attribute_index]->mod_bvalues[0]->bv_val = ZSTR_VAL(value);
+			ldap_mods[attribute_index]->mod_bvalues[0]->bv_len = ZSTR_LEN(value);
+			ldap_mods[attribute_index]->mod_bvalues[1] = NULL;
 		} else {
-			for (j = 0; j < num_values; j++) {
-				if ((ivalue = zend_hash_index_find(Z_ARRVAL_P(value), j)) == NULL) {
-					zend_argument_value_error(3, "must contain arrays with consecutive integer indices starting from 0");
-					num_berval[i] = j;
-					num_attribs = i + 1;
-					RETVAL_FALSE;
-					goto cleanup;
-				}
-				convert_to_string(ivalue);
-				if (EG(exception)) {
-					RETVAL_FALSE;
-					goto cleanup;
-				}
-				ldap_mods[i]->mod_bvalues[j] = (struct berval *) emalloc (sizeof(struct berval));
-				ldap_mods[i]->mod_bvalues[j]->bv_val = Z_STRVAL_P(ivalue);
-				ldap_mods[i]->mod_bvalues[j]->bv_len = Z_STRLEN_P(ivalue);
+			SEPARATE_ARRAY(attribute_values);
+			uint32_t num_values = zend_hash_num_elements(Z_ARRVAL_P(attribute_values));
+			if (num_values == 0) {
+				zend_argument_value_error(3, "list of attribute values must not be empty");
+				RETVAL_FALSE;
+				goto cleanup;
 			}
+			if (!zend_array_is_list(Z_ARRVAL_P(attribute_values))) {
+				zend_argument_value_error(3, "must be a list of attribute values");
+				RETVAL_FALSE;
+				goto cleanup;
+			}
+
+			ldap_mods[attribute_index]->mod_bvalues = safe_emalloc((num_values + 1), sizeof(struct berval *), 0);
+			/* Zero out the list */
+			memset(ldap_mods[attribute_index]->mod_bvalues, 0, sizeof(struct berval *) * (num_values+1));
+
+			zend_ulong attribute_value_index = 0;
+			zval *attribute_value = NULL;
+			ZEND_HASH_FOREACH_NUM_KEY_VAL(Z_ARRVAL_P(attribute_values), attribute_value_index, attribute_value) {
+				zend_string *value = php_ldap_try_get_ldap_value_from_zval(attribute_value);
+				if (UNEXPECTED(value == NULL)) {
+					RETVAL_FALSE;
+					goto cleanup;
+				}
+				ldap_mods[attribute_index]->mod_bvalues[attribute_value_index] = (struct berval *) emalloc (sizeof(struct berval));
+				/* The string will be free by php_ldap_zend_string_release_from_char_pointer() during cleanup */
+				ldap_mods[attribute_index]->mod_bvalues[attribute_value_index]->bv_val = ZSTR_VAL(value);
+				ldap_mods[attribute_index]->mod_bvalues[attribute_value_index]->bv_len = ZSTR_LEN(value);
+			} ZEND_HASH_FOREACH_END();
+			ldap_mods[attribute_index]->mod_bvalues[num_values] = NULL;
 		}
-		ldap_mods[i]->mod_bvalues[num_values] = NULL;
-		zend_hash_move_forward(Z_ARRVAL_P(entry));
-	}
+
+		attribute_index++;
+	} ZEND_HASH_FOREACH_END();
 	ldap_mods[num_attribs] = NULL;
 
-	if (serverctrls) {
-		lserverctrls = _php_ldap_controls_from_array(ld->link, serverctrls, 4);
+	if (server_controls_ht) {
+		lserverctrls = php_ldap_controls_from_array(ld->link, server_controls_ht, 4);
 		if (lserverctrls == NULL) {
 			RETVAL_FALSE;
 			goto cleanup;
 		}
 	}
 
-/* check flag to see if do_mod was called to perform full add , gerrit thomson */
+	/* check flag to see if do_mod was called to perform full add , gerrit thomson */
+	int ldap_status_code = LDAP_SUCCESS;
+	int msgid;
 	if (is_full_add == 1) {
 		if (ext) {
-			i = ldap_add_ext(ld->link, dn, ldap_mods, lserverctrls, NULL, &msgid);
+			ldap_status_code = ldap_add_ext(ld->link, dn, ldap_mods, lserverctrls, NULL, &msgid);
 		} else {
-			i = ldap_add_ext_s(ld->link, dn, ldap_mods, lserverctrls, NULL);
+			ldap_status_code = ldap_add_ext_s(ld->link, dn, ldap_mods, lserverctrls, NULL);
 		}
-		if (i != LDAP_SUCCESS) {
-			php_error_docref(NULL, E_WARNING, "Add: %s", ldap_err2string(i));
+		if (ldap_status_code != LDAP_SUCCESS) {
+			php_error_docref(NULL, E_WARNING, "Add: %s", ldap_err2string(ldap_status_code));
 			RETVAL_FALSE;
 		} else if (ext) {
-			i = ldap_result(ld->link, msgid, 1 /* LDAP_MSG_ALL */, NULL, &ldap_res);
-			if (i == -1) {
+			ldap_status_code = ldap_result(ld->link, msgid, 1 /* LDAP_MSG_ALL */, NULL, &ldap_res);
+			if (ldap_status_code == -1) {
 				php_error_docref(NULL, E_WARNING, "Add operation failed");
 				RETVAL_FALSE;
 				goto cleanup;
@@ -2293,16 +2367,16 @@ static void php_ldap_do_modify(INTERNAL_FUNCTION_PARAMETERS, int oper, int ext)
 		} else RETVAL_TRUE;
 	} else {
 		if (ext) {
-			i = ldap_modify_ext(ld->link, dn, ldap_mods, lserverctrls, NULL, &msgid);
+			ldap_status_code = ldap_modify_ext(ld->link, dn, ldap_mods, lserverctrls, NULL, &msgid);
 		} else {
-			i = ldap_modify_ext_s(ld->link, dn, ldap_mods, lserverctrls, NULL);
+			ldap_status_code = ldap_modify_ext_s(ld->link, dn, ldap_mods, lserverctrls, NULL);
 		}
-		if (i != LDAP_SUCCESS) {
-			php_error_docref(NULL, E_WARNING, "Modify: %s", ldap_err2string(i));
+		if (ldap_status_code != LDAP_SUCCESS) {
+			php_error_docref(NULL, E_WARNING, "Modify: %s", ldap_err2string(ldap_status_code));
 			RETVAL_FALSE;
 		} else if (ext) {
-			i = ldap_result(ld->link, msgid, 1 /* LDAP_MSG_ALL */, NULL, &ldap_res);
-			if (i == -1) {
+			ldap_status_code = ldap_result(ld->link, msgid, 1 /* LDAP_MSG_ALL */, NULL, &ldap_res);
+			if (ldap_status_code == -1) {
 				php_error_docref(NULL, E_WARNING, "Modify operation failed");
 				RETVAL_FALSE;
 				goto cleanup;
@@ -2316,15 +2390,18 @@ static void php_ldap_do_modify(INTERNAL_FUNCTION_PARAMETERS, int oper, int ext)
 	}
 
 cleanup:
-	for (i = 0; i < num_attribs; i++) {
-		efree(ldap_mods[i]->mod_type);
-		for (j = 0; j < num_berval[i]; j++) {
-			efree(ldap_mods[i]->mod_bvalues[j]);
+	for (LDAPMod **ptr = ldap_mods; *ptr != NULL; ptr++) {
+		LDAPMod *mod = *ptr;
+		if (mod->mod_bvalues != NULL) {
+			for (struct berval **bval_ptr = mod->mod_bvalues; *bval_ptr != NULL; bval_ptr++) {
+				struct berval *bval = *bval_ptr;
+				php_ldap_zend_string_release_from_char_pointer(bval->bv_val);
+				efree(bval);
+			}
+			efree(mod->mod_bvalues);
 		}
-		efree(ldap_mods[i]->mod_bvalues);
-		efree(ldap_mods[i]);
+		efree(mod);
 	}
-	efree(num_berval);
 	efree(ldap_mods);
 
 	if (lserverctrls) {
@@ -2397,8 +2474,8 @@ PHP_FUNCTION(ldap_mod_del_ext)
 /* {{{ php_ldap_do_delete */
 static void php_ldap_do_delete(INTERNAL_FUNCTION_PARAMETERS, int ext)
 {
-	zval *serverctrls = NULL;
 	zval *link;
+	HashTable *server_controls_ht = NULL;
 	ldap_linkdata *ld;
 	LDAPControl **lserverctrls = NULL;
 	ldap_resultdata *result;
@@ -2407,15 +2484,15 @@ static void php_ldap_do_delete(INTERNAL_FUNCTION_PARAMETERS, int ext)
 	int rc, msgid;
 	size_t dn_len;
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS(), "Op|a!", &link, ldap_link_ce, &dn, &dn_len, &serverctrls) != SUCCESS) {
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "Op|h!", &link, ldap_link_ce, &dn, &dn_len, &server_controls_ht) != SUCCESS) {
 		RETURN_THROWS();
 	}
 
 	ld = Z_LDAP_LINK_P(link);
 	VERIFY_LDAP_LINK_CONNECTED(ld);
 
-	if (serverctrls) {
-		lserverctrls = _php_ldap_controls_from_array(ld->link, serverctrls, 3);
+	if (server_controls_ht) {
+		lserverctrls = php_ldap_controls_from_array(ld->link, server_controls_ht, 3);
 		if (lserverctrls == NULL) {
 			RETVAL_FALSE;
 			goto cleanup;
@@ -2473,11 +2550,11 @@ PHP_FUNCTION(ldap_delete_ext)
 /* {{{ Perform multiple modifications as part of one operation */
 PHP_FUNCTION(ldap_modify_batch)
 {
-	zval *server_controls_zv = NULL;
 	zval *link;
 	char *dn;
 	size_t dn_len;
 	HashTable *modifications;
+	HashTable *server_controls_ht = NULL;
 	LDAPControl **lserverctrls = NULL;
 
 	/*
@@ -2504,7 +2581,7 @@ PHP_FUNCTION(ldap_modify_batch)
 	];
 	*/
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS(), "Oph/|a!", &link, ldap_link_ce, &dn, &dn_len, &modifications, &server_controls_zv) != SUCCESS) {
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "Oph/|h!", &link, ldap_link_ce, &dn, &dn_len, &modifications, &server_controls_ht) != SUCCESS) {
 		RETURN_THROWS();
 	}
 
@@ -2524,6 +2601,7 @@ PHP_FUNCTION(ldap_modify_batch)
 
 	zval *modification_zv = NULL;
 	ZEND_HASH_FOREACH_VAL(modifications, modification_zv) {
+		ZVAL_DEREF(modification_zv);
 		if (Z_TYPE_P(modification_zv) != IS_ARRAY) {
 			zend_argument_type_error(3, "must only contain arrays");
 			RETURN_THROWS();
@@ -2544,6 +2622,8 @@ PHP_FUNCTION(ldap_modify_batch)
 			zend_argument_value_error(3, "a modification entry must contain the \"" LDAP_MODIFY_BATCH_ATTRIB "\" option");
 			RETURN_THROWS();
 		}
+
+		ZVAL_DEREF(attrib);
 		if (UNEXPECTED(Z_TYPE_P(attrib) != IS_STRING)) {
 			zend_argument_type_error(3, "the value for option \"" LDAP_MODIFY_BATCH_ATTRIB "\" must be of type string, %s given", zend_zval_value_name(attrib));
 			RETURN_THROWS();
@@ -2558,6 +2638,8 @@ PHP_FUNCTION(ldap_modify_batch)
 			zend_argument_value_error(3, "a modification entry must contain the \"" LDAP_MODIFY_BATCH_MODTYPE "\" option");
 			RETURN_THROWS();
 		}
+
+		ZVAL_DEREF(modtype_zv);
 		if (UNEXPECTED(Z_TYPE_P(modtype_zv) != IS_LONG)) {
 			zend_argument_type_error(3, "the value for option \"" LDAP_MODIFY_BATCH_MODTYPE "\" must be of type int, %s given", zend_zval_value_name(attrib));
 			RETURN_THROWS();
@@ -2592,6 +2674,8 @@ PHP_FUNCTION(ldap_modify_batch)
 			}
 			continue;
 		}
+
+		ZVAL_DEREF(modification_values_zv);
 		if (Z_TYPE_P(modification_values_zv) != IS_ARRAY) {
 			zend_argument_type_error(3, "the value for option \"" LDAP_MODIFY_BATCH_VALUES "\" must be of type array, %s given", zend_zval_value_name(attrib));
 			RETURN_THROWS();
@@ -2613,8 +2697,8 @@ PHP_FUNCTION(ldap_modify_batch)
 	/* validation of modifications array was successful */
 
 	/* Check that the LDAP server controls array is valid */
-	if (server_controls_zv) {
-		lserverctrls = _php_ldap_controls_from_array(ld->link, server_controls_zv, 4);
+	if (server_controls_ht) {
+		lserverctrls = php_ldap_controls_from_array(ld->link, server_controls_ht, 4);
 		if (lserverctrls == NULL) {
 			_php_ldap_controls_free(&lserverctrls);
 			RETURN_FALSE;
@@ -2790,21 +2874,21 @@ PHP_FUNCTION(ldap_error)
 /* {{{ Determine if an entry has a specific value for one of its attributes */
 PHP_FUNCTION(ldap_compare)
 {
-	zval *serverctrls = NULL;
 	zval *link;
 	char *dn, *attr;
 	size_t dn_len, attr_len;
+	HashTable *server_controls_ht = NULL;
 	ldap_linkdata *ld;
 	LDAPControl **lserverctrls = NULL;
 	int ldap_errno;
 	struct berval lvalue;
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS(), "Opps|a!",
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "Opps|h!",
 		&link, ldap_link_ce,
 		&dn, &dn_len,
 		&attr, &attr_len,
 		&lvalue.bv_val, &lvalue.bv_len,
-		&serverctrls
+		&server_controls_ht
 	) != SUCCESS) {
 		RETURN_THROWS();
 	}
@@ -2812,8 +2896,8 @@ PHP_FUNCTION(ldap_compare)
 	ld = Z_LDAP_LINK_P(link);
 	VERIFY_LDAP_LINK_CONNECTED(ld);
 
-	if (serverctrls) {
-		lserverctrls = _php_ldap_controls_from_array(ld->link, serverctrls, 5);
+	if (server_controls_ht) {
+		lserverctrls = php_ldap_controls_from_array(ld->link, server_controls_ht, 5);
 		if (lserverctrls == NULL) {
 			RETVAL_FALSE;
 			goto cleanup;
@@ -3195,7 +3279,7 @@ PHP_FUNCTION(ldap_set_option)
 				RETURN_THROWS();
 			}
 
-			ctrls = _php_ldap_controls_from_array(ldap, newval, 3);
+			ctrls = php_ldap_controls_from_array(ldap, Z_ARRVAL_P(newval), 3);
 
 			if (ctrls == NULL) {
 				RETURN_FALSE;
@@ -3470,7 +3554,6 @@ PHP_FUNCTION(ldap_parse_reference)
 /* {{{ php_ldap_do_rename */
 static void php_ldap_do_rename(INTERNAL_FUNCTION_PARAMETERS, int ext)
 {
-	zval *serverctrls = NULL;
 	zval *link;
 	ldap_linkdata *ld;
 	LDAPControl **lserverctrls = NULL;
@@ -3480,8 +3563,9 @@ static void php_ldap_do_rename(INTERNAL_FUNCTION_PARAMETERS, int ext)
 	char *dn, *newrdn, *newparent;
 	size_t dn_len, newrdn_len, newparent_len;
 	bool deleteoldrdn;
+	HashTable *server_controls_ht = NULL;
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS(), "Opppb|a!", &link, ldap_link_ce, &dn, &dn_len, &newrdn, &newrdn_len, &newparent, &newparent_len, &deleteoldrdn, &serverctrls) != SUCCESS) {
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "Opppb|h!", &link, ldap_link_ce, &dn, &dn_len, &newrdn, &newrdn_len, &newparent, &newparent_len, &deleteoldrdn, &server_controls_ht) != SUCCESS) {
 		RETURN_THROWS();
 	}
 
@@ -3493,8 +3577,8 @@ static void php_ldap_do_rename(INTERNAL_FUNCTION_PARAMETERS, int ext)
 	}
 
 #if (LDAP_API_VERSION > 2000) || defined(HAVE_ORALDAP)
-	if (serverctrls) {
-		lserverctrls = _php_ldap_controls_from_array(ld->link, serverctrls, 6);
+	if (server_controls_ht) {
+		lserverctrls = php_ldap_controls_from_array(ld->link, server_controls_ht, 6);
 		if (lserverctrls == NULL) {
 			RETVAL_FALSE;
 			goto cleanup;
@@ -3801,10 +3885,10 @@ PHP_FUNCTION(ldap_8859_to_t61)
 /* {{{ Extended operations, Pierangelo Masarati */
 #ifdef HAVE_LDAP_EXTENDED_OPERATION_S
 static void php_ldap_exop(INTERNAL_FUNCTION_PARAMETERS, bool force_sync) {
-	zval *serverctrls = NULL;
 	zval *link, *retdata = NULL, *retoid = NULL;
 	char *lretoid = NULL;
 	zend_string *reqoid, *reqdata = NULL;
+	HashTable *server_controls_ht = NULL;
 	struct berval lreqdata, *lretdata = NULL;
 	ldap_linkdata *ld;
 	ldap_resultdata *result;
@@ -3819,7 +3903,7 @@ static void php_ldap_exop(INTERNAL_FUNCTION_PARAMETERS, bool force_sync) {
 		}
 	}
 
-	if (zend_parse_parameters(ZEND_NUM_ARGS(), "OP|S!a!zz", &link, ldap_link_ce, &reqoid, &reqdata, &serverctrls, &retdata, &retoid) != SUCCESS) {
+	if (zend_parse_parameters(ZEND_NUM_ARGS(), "OP|S!h!zz", &link, ldap_link_ce, &reqoid, &reqdata, &server_controls_ht, &retdata, &retoid) != SUCCESS) {
 		RETURN_THROWS();
 	}
 
@@ -3833,8 +3917,8 @@ static void php_ldap_exop(INTERNAL_FUNCTION_PARAMETERS, bool force_sync) {
 		lreqdata.bv_len = 0;
 	}
 
-	if (serverctrls) {
-		lserverctrls = _php_ldap_controls_from_array(ld->link, serverctrls, 4);
+	if (server_controls_ht) {
+		lserverctrls = php_ldap_controls_from_array(ld->link, server_controls_ht, 4);
 		if (lserverctrls == NULL) {
 			RETVAL_FALSE;
 			goto cleanup;
