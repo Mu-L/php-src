@@ -80,6 +80,10 @@ PHP 8.5 UPGRADE NOTES
   . Calling the mysqli constructor on an already-constructed object
     is now no longer possible and throws an Error.
 
+- ODBC:
+  . ODBC now assumes that at least ODBC 3.5 functionality is available. The
+    ODBCVER definition and build system flags to control it have been removed.
+
 - Opcache:
   . The Opcache extension is now always built into the PHP binary and is always
     loaded. The INI directives opcache.enable and opcache.enable_cli are still
@@ -268,8 +272,6 @@ PHP 8.5 UPGRADE NOTES
     and the function returns false. Previously, these errors were silently
     ignored. This change affects only the sendmail transport.
   . getimagesize() now supports HEIF/HEIC images.
-
-- Standard:
   . getimagesize() now supports SVG images when ext-libxml is also loaded.
     Similarly, image_type_to_extension() and image_type_to_mime_type()
     now also handle IMAGETYPE_SVG.
